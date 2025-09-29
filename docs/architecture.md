@@ -91,6 +91,9 @@ Axonic Assistant es un agente conversacional proactivo diseñado para operar en 
 - **RPC `get_available_slots(service_id, date_range)`:** Cacheable para respuestas rápidas.
 - **Trigger `on_appointment_cancelled`:** Inserta evento en `notifications_queue` para el optimizador "Tetris".
 
+### 4.3. Script de aprovisionamiento
+- El archivo [`supabase/schema.sql`](../supabase/schema.sql) contiene la definición íntegra de tablas, tipos, vistas, RPC y datos seed para levantar el entorno descrito. Ejecuta este script en tu proyecto de Supabase (SQL Editor → Run) antes de conectar los flujos de n8n.
+
 ## 5. Flujos n8n Propuestos
 ### 5.1. Webhook Entrante WhatsApp
 1. Webhook → Nodo Function: normaliza payload.
