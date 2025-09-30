@@ -1,0 +1,664 @@
+Documentación Técnica del Esquema de Base de Datos PostgreSQL
+
+1.0 Introducción y Arquitectura General
+
+Este documento sirve como la referencia técnica definitiva para el esquema de la base de datos PostgreSQL del sistema. Ha sido diseñado para proporcionar una comprensión profunda y funcional de la estructura de datos, la lógica de negocio encapsulada y los mecanismos de seguridad implementados. El esquema está concebido para soportar una aplicación compleja de gestión de servicios, incluyendo un sistema de reservas, manejo de inventario, asignación de recursos y una base de conocimiento inteligente. La comprensión de este documento es fundamental para el desarrollo de nuevas funcionalidades, el mantenimiento de la aplicación y la administración eficiente de la base de datos.
+
+La arquitectura del esquema está organizada en varios subsistemas lógicos interconectados, cada uno responsable de un área funcional específica:
+
+* Gestión de Clientes y Servicios: El núcleo del negocio, que modela los perfiles de usuario, el catálogo de servicios, el inventario de productos y las reglas de venta cruzada.
+* Sistema de Citas y Recursos: Gestiona la programación de citas, las listas de espera y la asignación de los recursos necesarios (salas, equipos, personal) para la prestación de cada servicio.
+* Base de Conocimiento: Un sistema de preguntas y respuestas diseñado para la consulta inteligente, equipado con capacidades de búsqueda por similitud de texto (fuzzy search) y ranking de relevancia.
+* Auditoría y Notificaciones: Mecanismos transversales que registran acciones críticas en el sistema y gestionan una cola de notificaciones asíncronas para procesos desacoplados.
+* Seguridad: Un modelo de seguridad granular basado en roles que garantiza que los usuarios solo puedan acceder y modificar los datos que les corresponden.
+
+A continuación, se analizarán las dependencias fundamentales que habilitan las capacidades avanzadas de este esquema.
+
+2.0 Dependencias y Extensiones Requeridas
+
+La funcionalidad avanzada del esquema, particularly en las áreas de identificación única y búsqueda de texto, depende de la activación de varias extensiones estándar de PostgreSQL. El uso estratégico de estas extensiones permite enriquecer las capacidades nativas de la base de datos, optimizando el rendimiento y simplificando la lógica de la aplicación al delegar operaciones complejas directamente al motor de la base de datos.
+
+La correcta instalación y activación de las siguientes extensiones es un prerrequisito indispensable para el funcionamiento del esquema:
+
+* pgcrypto
+  * Función Crítica: Proporciona funciones de generación de valores criptográficamente seguros. En este esquema, su rol principal es la generación de identificadores únicos universales (UUIDs) a través de la función gen_random_uuid(), utilizada como valor por defecto en la mayoría de las claves primarias para garantizar identificadores únicos y no secuenciales.
+* unaccent
+  * Función Crítica: Ofrece un diccionario y una función para eliminar acentos y otros diacríticos del texto. Es una pieza clave en la normalización de texto, utilizada dentro de la función norm_txt() para asegurar que las búsquedas sean insensibles a los acentos, mejorando significativamente la experiencia de búsqueda para el usuario final.
+* pg_trgm
+  * Función Crítica: Habilita el cálculo de similitud entre cadenas de texto basado en trigramas (secuencias de tres caracteres). Esta extensión es el motor detrás de las capacidades de búsqueda "fuzzy" o por similitud en la base de conocimiento, permitiendo encontrar resultados relevantes incluso cuando la consulta del usuario contiene errores tipográficos o variaciones. Se utiliza tanto en la función similarity() como en la creación de índices GIN (gin_trgm_ops) para acelerar estas búsquedas.
+
+Una vez configuradas estas dependencias, el esquema define una serie de tipos de datos personalizados que estructuran la lógica de negocio.
+
+3.0 Tipos de Datos Personalizados (ENUMs)
+
+Para garantizar la integridad de los datos y la coherencia a lo largo del sistema, el esquema utiliza tipos enumerados (ENUMs) de PostgreSQL. Este enfoque restringe los valores de ciertas columnas a un conjunto predefinido y explícito de opciones, lo que elimina la posibilidad de errores de tipeo, mejora la legibilidad del código y representa de forma segura los diferentes estados de las entidades de negocio.
+
+A continuación se detallan los tipos ENUM definidos:
+
+
+
+Define los roles de usuario dentro del sistema, determinando su nivel de acceso y permisos.
+
+Valor Permitido	Descripción
+owner	Un usuario con privilegios administrativos totales sobre el sistema.
+lead	Un usuario estándar o cliente del sistema.
+
+
+
+Representa el ciclo de vida de una cita.
+
+Valor Permitido	Descripción
+pending	La cita ha sido solicitada pero aún no ha sido confirmada.
+confirmed	La cita ha sido confirmada y los recursos están potencialmente asignados.
+cancelled	La cita ha sido cancelada por el cliente o el administrador.
+
+
+
+Modela el estado de una entrada en la lista de espera para un servicio.
+
+Valor Permitido	Descripción
+active	El usuario está esperando activamente un hueco disponible.
+notified	Se ha notificado al usuario sobre un hueco disponible.
+converted	El usuario ha aceptado el hueco y la entrada se ha convertido en una cita.
+
+
+
+Clasifica los diferentes tipos de recursos que pueden ser requeridos por un servicio.
+
+Valor Permitido	Descripción
+room	Un recurso físico como una sala o cabina.
+equipment	Un equipo o maquinaria específica.
+staff	Un miembro del personal con una habilidad particular.
+
+
+
+Define el estado operativo de un recurso.
+
+Valor Permitido	Descripción
+available	El recurso está operativo y disponible para ser asignado.
+maintenance	El recurso está temporalmente fuera de servicio por mantenimiento.
+unavailable	El recurso no está disponible por otras razones (e.g., averiado).
+
+Estos tipos de datos actúan como los bloques de construcción fundamentales para las tablas que conforman el modelo de datos principal.
+
+4.0 Esquema de Tablas (Data Model)
+
+Las tablas constituyen el núcleo del almacenamiento de datos del sistema. Están agrupadas en subsistemas lógicos para reflejar las distintas áreas funcionales de la aplicación y facilitar la comprensión del modelo relacional.
+
+4.1 Subsistema de Gestión de Clientes y Servicios
+
+Este conjunto de tablas modela las entidades centrales del negocio: los clientes, los servicios que se ofrecen y los productos de inventario.
+
+
+
+Almacena la información de todos los usuarios del sistema, tanto clientes (lead) como administradores (owner).
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del perfil.
+phone_number	text	UNIQUE, NOT NULL	Número de teléfono, usado como identificador de inicio de sesión.
+role	public.user_role	NOT NULL, DEFAULT 'lead'	Rol del usuario en el sistema.
+name	text		Nombre del usuario.
+email	text		Correo electrónico del usuario.
+metadata	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Campo para datos adicionales no estructurados.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación del perfil.
+updated_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la última actualización.
+
+* Restricciones con Nombre:
+  * profiles_phone_not_empty (CHECK): Asegura que el campo phone_number no contenga únicamente espacios en blanco, garantizando la validez del identificador.
+
+
+
+Contiene el catálogo de todos los servicios ofrecidos por el negocio.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del servicio.
+name	text	NOT NULL	Nombre del servicio.
+description	text		Descripción detallada del servicio.
+base_price	numeric(10, 2)	NOT NULL, DEFAULT 0	Precio base del servicio.
+duration_minutes	int	NOT NULL, DEFAULT 60	Duración del servicio en minutos.
+metadata	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Campo para datos adicionales como la categoría.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación del servicio.
+updated_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la última actualización.
+
+* Restricciones con Nombre:
+  * services_price_non_negative (CHECK): Impide que se registren precios negativos, manteniendo la integridad financiera.
+  * services_duration_positive (CHECK): Garantiza que todos los servicios tengan una duración positiva mayor que cero.
+
+
+
+Gestiona el stock de productos físicos.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del producto.
+sku	text	UNIQUE, NOT NULL	Stock Keeping Unit, identificador único de producto.
+name	text	NOT NULL	Nombre del producto.
+quantity	int	NOT NULL, DEFAULT 0	Cantidad actual en stock.
+reorder_threshold	int	NOT NULL, DEFAULT 0	Umbral para generar una alerta de reabastecimiento.
+price	numeric(10, 2)	NOT NULL, DEFAULT 0	Precio de venta del producto.
+metadata	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Campo para datos adicionales como marca o categoría.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación del producto.
+updated_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la última actualización.
+
+* Restricciones con Nombre:
+  * inv_non_negative (CHECK): Asegura que la cantidad en stock (quantity) nunca sea negativa.
+  * inventory_price_non_negative (CHECK): Impide que se registren precios de inventario negativos.
+  * inventory_reorder_non_negative (CHECK): Asegura que el umbral de reorden (reorder_threshold) no sea negativo.
+
+
+
+Define reglas para recomendar servicios adicionales basados en un servicio previamente seleccionado.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único de la regla.
+trigger_service_id	uuid	NOT NULL, FOREIGN KEY (services)	Servicio que activa la recomendación.
+recommended_service_id	uuid	NOT NULL, FOREIGN KEY (services)	Servicio que se recomienda.
+message_template	text	NOT NULL	Plantilla del mensaje de recomendación.
+priority	int	NOT NULL, DEFAULT 1	Prioridad de la regla.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación de la regla.
+
+* Restricciones con Nombre:
+  * cross_sell_unique_pair (UNIQUE on trigger_service_id, recommended_service_id): Guarantees that no duplicate recommendation rule exists for the same pair of services.
+* Índices:
+  * idx_cross_sell_trigger: Acelera la búsqueda de reglas basadas en el servicio activador.
+
+4.2 Subsistema de Citas y Recursos
+
+Este conjunto de tablas gestiona la operativa diaria de programación, incluyendo las citas, las listas de espera y los recursos necesarios.
+
+
+
+El corazón del sistema de reservas, donde se almacenan todas las citas de los clientes.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único de la cita.
+profile_id	uuid	NOT NULL, FOREIGN KEY (profiles)	Cliente asociado a la cita.
+service_id	uuid	NOT NULL, FOREIGN KEY (services)	Servicio reservado.
+calendar_event_id	text		ID del evento en un calendario externo (e.g., Google Calendar).
+status	public.appointment_status	NOT NULL, DEFAULT 'pending'	Estado actual de la cita.
+start_time	timestamptz	NOT NULL	Fecha y hora de inicio de la cita.
+end_time	timestamptz	NOT NULL	Fecha y hora de fin de la cita.
+notes	text		Notas adicionales sobre la cita.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación de la cita.
+updated_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la última actualización.
+
+* Restricciones con Nombre:
+  * appt_time_window (CHECK): Asegura que la hora de inicio (start_time) sea siempre anterior a la hora de fin (end_time).
+* Índices: Múltiples índices (idx_appts_profile_id, idx_appts_service_id, idx_appts_start_time, idx_appts_status, etc.) optimizan las consultas por cliente, servicio, fecha y estado.
+
+
+
+Registra las solicitudes de clientes que desean un servicio en una fecha en la que no hay disponibilidad.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único de la entrada en la lista.
+service_id	uuid	NOT NULL, FOREIGN KEY (services)	Servicio deseado.
+desired_date	date	NOT NULL	Fecha deseada para el servicio.
+profile_id	uuid	NOT NULL, FOREIGN KEY (profiles)	Cliente en lista de espera.
+status	public.waitlist_status	NOT NULL, DEFAULT 'active'	Estado de la solicitud en la lista.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación de la solicitud.
+
+* Restricciones con Nombre:
+  * waitlist_unique_profile_service_date (UNIQUE on profile_id, service_id, desired_date): Impide que un mismo cliente se apunte varias veces al mismo servicio en la misma fecha.
+* Índices: idx_waitlist_status, idx_waitlist_desired_date, idx_waitlist_service_date para búsquedas eficientes.
+
+
+
+Catálogo de todos los recursos (salas, equipos, personal) disponibles.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del recurso.
+name	text	NOT NULL	Nombre descriptivo del recurso.
+type	public.resource_type	NOT NULL	Tipo de recurso.
+status	public.resource_status	NOT NULL, DEFAULT 'available'	Estado operativo actual del recurso.
+metadata	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Datos adicionales (e.g., capacidad, marca).
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación del recurso.
+updated_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la última actualización.
+
+* Índices: idx_resources_type, idx_resources_status, y idx_resources_type_status para optimizar filtros por tipo y estado.
+
+
+
+Tabla de asociación que define qué recursos y en qué cantidad son necesarios para cada servicio.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del requerimiento.
+service_id	uuid	NOT NULL, FOREIGN KEY (services)	Servicio que requiere el recurso.
+resource_id	uuid	NOT NULL, FOREIGN KEY (resources)	Recurso requerido.
+quantity	int	NOT NULL, DEFAULT 1	Cantidad del recurso necesaria.
+is_optional	boolean	NOT NULL, DEFAULT false	Indica si el recurso es opcional.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación del requerimiento.
+
+* Restricciones con Nombre:
+  * srr_unique_service_resource (UNIQUE on service_id, resource_id): Asegura que no se defina más de una vez el mismo requisito para un servicio.
+  * srr_quantity_positive (CHECK): Garantiza que la cantidad (quantity) requerida sea siempre mayor que cero.
+
+
+
+Tabla de asociación que registra los recursos específicos asignados a una cita confirmada.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único de la asignación.
+appointment_id	uuid	NOT NULL, FOREIGN KEY (appointments)	Cita a la que se asigna el recurso.
+resource_id	uuid	NOT NULL, FOREIGN KEY (resources)	Recurso asignado.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la asignación.
+
+* Restricciones con Nombre:
+  * ar_unique_appointment_resource (UNIQUE on appointment_id, resource_id): Previene la doble asignación de un mismo recurso a la misma cita.
+
+
+
+Permite bloquear la disponibilidad de un recurso durante un período de tiempo específico por razones como mantenimiento, vacaciones, etc.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del bloqueo.
+resource_id	uuid	NOT NULL, FOREIGN KEY (resources)	Recurso que se bloquea.
+start_time	timestamptz	NOT NULL	Inicio del período de bloqueo.
+end_time	timestamptz	NOT NULL	Fin del período de bloqueo.
+reason	text	NOT NULL	Motivo del bloqueo.
+metadata	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Datos adicionales sobre el bloqueo.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación del bloqueo.
+
+* Restricciones con Nombre:
+  * rb_time_window (CHECK): Asegura que la hora de inicio (start_time) sea anterior a la de fin (end_time).
+* Índices:
+  * idx_rb_resource_range: Un índice compuesto que optimiza las consultas de solapamiento de tiempo para un recurso específico, crucial para la lógica de disponibilidad.
+
+4.3 Subsistema de Base de Conocimiento (Knowledge Base)
+
+Este subsistema proporciona una base de datos de preguntas y respuestas con capacidades de búsqueda avanzada y seguimiento de popularidad.
+
+
+
+Almacena las entradas de la base de conocimiento (preguntas y respuestas).
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único de la entrada.
+category	text		Categoría temática de la entrada.
+question	text	NOT NULL	La pregunta en su formato original.
+answer	text	NOT NULL	La respuesta a la pregunta.
+metadata	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Datos adicionales, como palabras clave.
+last_modified_by	uuid		ID del perfil que realizó la última modificación.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de creación.
+updated_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la última actualización.
+question_normalized	text	NOT NULL	Versión normalizada de la pregunta (minúsculas, sin acentos) para búsquedas.
+answer_normalized	text	GENERATED ALWAYS AS (public.norm_txt(answer)) STORED	Versión normalizada de la respuesta, generada automáticamente.
+view_count	int	NOT NULL, DEFAULT 0, INDEX idx_kb_view_count	Contador de visualizaciones de la pregunta.
+
+* Columnas Generadas: question_normalized y answer_normalized son cruciales. La primera se popula mediante un TRIGGER y la segunda es una columna generada. Ambas almacenan una versión del texto procesada por la función norm_txt para hacer las búsquedas más efectivas y consistentes.
+* Restricciones con Nombre:
+  * knowledge_base_question_key (UNIQUE on question_normalized): Garantiza que no puedan existir dos preguntas idénticas una vez normalizadas, evitando duplicados semánticos.
+* Índices GIN/TRGM:
+  * idx_kb_qnorm_trgm (sobre question_normalized): Índice GIN que utiliza gin_trgm_ops para acelerar drásticamente las búsquedas por similitud de texto ("fuzzy search") en las preguntas.
+  * idx_kb_answer_trgm (sobre answer_normalized): Índice GIN análogo al anterior, pero optimizado para búsquedas por similitud en el cuerpo de las respuestas.
+  * Estos índices son críticos para el rendimiento de las funciones search_knowledge_base y search_knowledge_hybrid, permitiéndoles ejecutar consultas de similitud de forma eficiente sin realizar lentos escaneos secuenciales de la tabla.
+
+
+
+Registra las visualizaciones individuales de las preguntas para implementar un sistema de conteo con límite de frecuencia (rate-limiting).
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+kb_id	uuid	PRIMARY KEY (kb_id, phone_hash)	ID de la pregunta visualizada.
+phone_hash	text	PRIMARY KEY (kb_id, phone_hash)	Identificador único y anonimizado del usuario que realiza la visualización.
+last_view	timestamptz	NOT NULL	Fecha y hora de la última visualización por este usuario.
+
+
+
+Permite a los usuarios enviar sugerencias de nuevas preguntas para enriquecer la base de conocimiento.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único de la sugerencia.
+profile_id	uuid	FOREIGN KEY (profiles)	Usuario que realizó la sugerencia.
+suggested_question	text	NOT NULL	El texto de la pregunta sugerida.
+context	text		Contexto adicional sobre la sugerencia.
+status	text	NOT NULL, DEFAULT 'pending', CHECK (status IN ('pending', 'approved', 'rejected'))	Estado de la sugerencia.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de la sugerencia.
+reviewed_at	timestamptz		Fecha y hora de la revisión.
+reviewed_by	uuid	FOREIGN KEY (profiles)	Usuario que revisó la sugerencia.
+
+* Índices: idx_ks_status y idx_ks_created para filtrar y ordenar sugerencias eficientemente.
+
+4.4 Subsistema de Auditoría y Notificaciones
+
+Estas tablas de soporte proporcionan capacidades de seguimiento y procesamiento asíncrono.
+
+
+
+Registra eventos importantes que ocurren en el sistema para fines de auditoría y seguimiento.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	uuid	PRIMARY KEY, DEFAULT gen_random_uuid()	Identificador único del registro de auditoría.
+profile_id	uuid	FOREIGN KEY (profiles)	Usuario que realizó la acción.
+action	text	NOT NULL	Descripción de la acción realizada (e.g., 'user_login').
+payload	jsonb	NOT NULL, DEFAULT '{}'::jsonb	Datos relevantes asociados a la acción.
+timestamp	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora en que ocurrió la acción.
+
+* Índices: idx_audit_profile y idx_audit_timestamp para filtrar por usuario y ordenar por fecha.
+
+
+
+Actúa como una cola de mensajes para procesar tareas de forma asíncrona, como el envío de notificaciones.
+
+Nombre de Columna	Tipo de Dato	Restricciones / Índices	Descripción
+id	bigserial	PRIMARY KEY	Identificador secuencial de la notificación.
+event_type	text	NOT NULL	Tipo de evento que generó la notificación.
+payload	jsonb	NOT NULL	Datos necesarios para procesar la notificación.
+created_at	timestamptz	NOT NULL, DEFAULT now()	Fecha y hora de inserción en la cola.
+processed_at	timestamptz		Fecha y hora en que fue procesada. Null si está pendiente.
+
+* Índice Parcial: El índice idx_nq_pending se crea sobre la columna created_at pero solo para las filas WHERE processed_at IS NULL. Este diseño reduce drásticamente el I/O requerido para los procesos de trabajo (workers) que consultan la cola, ya que solo necesitan escanear la pequeña fracción de la tabla que contiene trabajos pendientes.
+
+Más allá del almacenamiento pasivo de datos, la base de datos implementa lógica activa a través de un sistema de disparadores y funciones para automatizar tareas y garantizar la integridad.
+
+5.0 Lógica de Negocio y Automatización
+
+El esquema no se limita a almacenar datos; implementa lógica de negocio activa a través de disparadores (triggers) y funciones almacenadas (procedures/RPCs). Este enfoque centraliza la lógica, garantiza la consistencia de los datos independientemente de cómo se acceda a ellos y permite la automatización de tareas críticas directamente en la base de datos.
+
+5.1 Disparadores (Triggers)
+
+Los disparadores son procedimientos que se ejecutan automáticamente en respuesta a eventos específicos de modificación de datos (INSERT, UPDATE, DELETE) en una tabla.
+
+
+
+* Tabla Asociada: public.knowledge_base
+* Evento: BEFORE INSERT OR UPDATE OF question
+* Función Ejecutada: public.kb_set_question_normalized()
+* Análisis Funcional: Este disparador es clave para la funcionalidad de búsqueda. Se ejecuta antes de una operación DML (INSERT o UPDATE) sobre la tabla knowledge_base y utiliza la función norm_txt para generar una versión normalizada (minúsculas, sin acentos, espacios colapsados) de la columna question. El resultado se almacena en question_normalized. Al gestionar la normalización mediante un disparador, el esquema garantiza la consistencia de los datos independientemente de la aplicación cliente, centraliza la regla de negocio y precalcula el valor normalizado para un rendimiento óptimo de las consultas.
+
+, , , , , 
+
+* Tablas Asociadas: profiles, services, appointments, inventory, knowledge_base, resources
+* Evento: BEFORE UPDATE
+* Función Ejecutada: public.set_updated_at()
+* Análisis Funcional: Estos disparadores implementan un comportamiento de auditoría simple pero efectivo. Cada vez que se actualiza una fila en cualquiera de las tablas asociadas, la función set_updated_at() se ejecuta automáticamente y establece el valor de la columna updated_at a la fecha y hora actuales (now()). Esto asegura que el campo de última actualización esté siempre al día sin necesidad de que la aplicación lo gestione manualmente.
+
+
+
+* Tabla Asociada: public.appointments
+* Evento: AFTER UPDATE
+* Función Ejecutada: public.on_appointment_cancelled()
+* Análisis Funcional: Este disparador integra el sistema de citas con la cola de notificaciones. Se activa después de una actualización en la tabla appointments. Si el nuevo estado de la cita es cancelled y el estado anterior no lo era, inserta un nuevo registro en la tabla notifications_queue. El payload de la notificación contiene detalles clave de la cita cancelada, permitiendo que un proceso externo (un "worker") pueda tomar acciones, como notificar a los clientes en lista de espera sobre el nuevo hueco disponible.
+
+5.2 Funciones y Procedimientos Almacenados (RPCs)
+
+El esquema expone una serie de funciones que encapsulan operaciones complejas, actuando como una API a nivel de base de datos (Remote Procedure Calls).
+
+
+
+* Propósito: Normaliza texto: minúsculas, sin acentos, espacios colapsados.
+* Firma de la Función: norm_txt(p text) returns text
+* Parámetros: | Nombre | Tipo   | Valor por Defecto | Descripción                     | | :----- | :----- | :---------------- | :------------------------------ | | p    | text | N/A               | El texto de entrada a normalizar. |
+* Retorno: text - El texto normalizado.
+* Análisis de la Lógica Interna: Es una función SQL immutable simple y altamente eficiente que encadena las funciones coalesce, unaccent, regexp_replace y lower para realizar la normalización en un solo paso.
+* Permisos: Uso interno general.
+
+
+
+* Propósito: Búsqueda por similitud usando pg_trgm.
+* Firma de la Función: search_knowledge_base(p_query text, p_similarity_threshold double precision, p_limit int) returns table(...)
+* Parámetros: | Nombre                   | Tipo             | Valor por Defecto | Descripción                                                                | | :----------------------- | :--------------- | :---------------- | :------------------------------------------------------------------------- | | p_query                | text           | N/A               | El término de búsqueda del usuario.                                        | | p_similarity_threshold | double precision | 0.20            | Umbral de similitud (0 a 1) para considerar un resultado relevante.        | | p_limit                | int            | 5               | Número máximo de resultados a devolver.                                    |
+* Retorno: Una tabla con las columnas id, category, question, answer, y similarity.
+* Análisis de la Lógica Interna: Normaliza la consulta del usuario usando norm_txt y la compara con la columna pre-normalizada question_normalized usando la función similarity(). Devuelve solo los resultados que superan el umbral, ordenados de mayor a menor similitud.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Búsqueda por palabras clave.
+* Firma de la Función: search_knowledge_by_keywords(p_keywords text[], p_limit int) returns table(...)
+* Parámetros: | Nombre        | Tipo     | Valor por Defecto | Descripción                         | | :------------ | :------- | :---------------- | :---------------------------------- | | p_keywords  | text[] | N/A               | Un array de palabras clave a buscar. | | p_limit     | int    | 5               | Número máximo de resultados a devolver. |
+* Retorno: Una tabla con las columnas id, category, question, answer, y keyword_matches.
+* Análisis de la Lógica Interna: Itera sobre el array de palabras clave y busca su presencia (usando ILIKE) en las columnas question_normalized y answer_normalized. Cuenta el número de coincidencias y ordena los resultados por este contador.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Búsqueda híbrida con scoring. Pregunta 24pts, Respuesta 16pts. Soporta filtro por categoría. CORREGIDA: sin ambigüedad de columnas.
+* Firma de la Función: search_knowledge_hybrid(p_query text, p_similarity_threshold double precision, p_limit int, p_category text) returns table(...)
+* Parámetros: | Nombre                   | Tipo             | Valor por Defecto | Descripción                                                                | | :----------------------- | :--------------- | :---------------- | :------------------------------------------------------------------------- | | p_query                | text           | N/A               | El término de búsqueda del usuario.                                        | | p_similarity_threshold | double precision | 0.15            | Umbral de similitud para la parte de la búsqueda por similitud.            | | p_limit                | int            | 5               | Número máximo de resultados a devolver.                                    | | p_category             | text           | null            | Permite filtrar los resultados por una categoría específica.               |
+* Retorno: Una tabla con las columnas id, category, question, answer, relevance_score, y match_type.
+* Análisis de la Lógica Interna: Esta función emplea una sofisticada estrategia híbrida para maximizar la relevancia. Combina una búsqueda por similitud amplia y tolerante a fallos (usando trigramas) con una búsqueda precisa por palabras clave que aplica pesos diferenciados, priorizando las coincidencias en la pregunta sobre la respuesta. Los resultados se unifican y se clasifican por un relevance_score compuesto para mostrar las mejores coincidencias posibles.
+  1. Normaliza la consulta de entrada y la divide en palabras clave.
+  2. Ejecuta dos búsquedas en paralelo usando CTEs: una por similitud y otra por palabras clave.
+  3. Aplica un scoring ponderado: En la búsqueda por palabras clave, una coincidencia en question_normalized otorga 24 puntos, mientras que una en answer_normalized otorga 16 puntos.
+  4. Combina los resultados, agrupa por entrada de la KB y calcula una puntuación de relevancia máxima (relevance_score).
+  5. Devuelve los resultados ordenados por esta puntuación.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Obtiene preguntas similares.
+* Firma de la Función: get_related_questions(p_question_id uuid, p_limit int) returns table(...)
+* Parámetros: | Nombre          | Tipo   | Valor por Defecto | Descripción                                           | | :-------------- | :----- | :---------------- | :---------------------------------------------------- | | p_question_id | uuid | N/A               | El ID de la pregunta de origen.                       | | p_limit       | int  | 3               | Número máximo de preguntas relacionadas a devolver.   |
+* Retorno: Una tabla con id, category, question y similarity.
+* Análisis de la Lógica Interna: Toma la pregunta normalizada de la entrada original y la compara con todas las demás preguntas en la tabla, usando la función similarity(). Devuelve las más similares que superen un umbral fijo de 0.15.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Incrementa view_count (sin rate-limit).
+* Firma de la Función: increment_kb_view_count(p_question_id uuid) returns void
+* Análisis de la Lógica Interna: Ejecuta una simple sentencia UPDATE para incrementar en 1 el view_count de la fila correspondiente.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Incrementa view_count con rate-limiting (60s). CORREGIDA: evalúa condición ANTES de actualizar last_view.
+* Firma de la Función: increment_kb_view_count_guarded(p_question_id uuid, p_phone_hash text) returns void
+* Parámetros: | Nombre         | Tipo   | Valor por Defecto | Descripción                                                                                                | | :------------- | :----- | :---------------- | :--------------------------------------------------------------------------------------------------------- | | p_question_id| uuid | N/A               | El ID de la pregunta visualizada.                                                                          | | p_phone_hash | text | N/A               | Un hash anonimizado que representa de forma única al usuario, derivado de su número de teléfono, para el seguimiento de vistas sin almacenar PII. |
+* Análisis de la Lógica Interna:
+  1. Consulta la tabla kb_views_footprint para obtener la última visualización de este usuario (p_phone_hash) para esta pregunta (p_question_id).
+  2. Determina si debe incrementar: si es la primera vez que la ve, o si han pasado más de 60 segundos desde la última vista. Esta evaluación se realiza antes de actualizar la marca de tiempo, lo que es clave para la correctitud de la lógica.
+  3. Actualiza (o inserta) el registro en kb_views_footprint con la hora actual.
+  4. Si la condición del paso 2 fue verdadera, incrementa el view_count en knowledge_base.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Calcula y devuelve los huecos de tiempo disponibles para un servicio específico dentro de un intervalo de fechas.
+* Firma de la Función: get_available_slots(p_service_id uuid, p_start timestamptz, p_end timestamptz, p_step_minutes int) returns table(...)
+* Análisis de la Lógica Interna: Itera desde p_start hasta p_end en incrementos de p_step_minutes. En cada paso, comprueba si un hueco de la duración del servicio se solaparía con alguna cita ya confirmed. Si no hay solapamiento, devuelve ese hueco como disponible.
+* Permisos: Función de consulta pública.
+
+
+
+* Propósito: Decrementa de forma segura la cantidad de un producto en el inventario.
+* Firma de la Función: decrement_inventory(p_sku text, p_qty int) returns void
+* Análisis de la Lógica Interna: Es una función transaccionalmente segura:
+  1. Valida que la cantidad a decrementar sea positiva.
+  2. Selecciona la fila del inventario usando FOR UPDATE, lo que la bloquea para prevenir condiciones de carrera si dos transacciones intentan decrementar el stock al mismo tiempo.
+  3. Verifica que haya suficiente stock. Si no, lanza una excepción.
+  4. Si todo es correcto, ejecuta el UPDATE para reducir la cantidad.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Una versión avanzada de get_available_slots que, además de comprobar la disponibilidad de tiempo, verifica que todos los recursos no opcionales requeridos por el servicio estén también disponibles.
+* Firma de la Función: get_available_slots_with_resources(p_service_id uuid, p_start timestamptz, p_end timestamptz, p_step_minutes int) returns table(...)
+* Retorno: Una tabla con slot_start, slot_end y una columna jsonb llamada available_resources.
+* Análisis de la Lógica Interna:
+  1. Obtiene los recursos requeridos de la tabla service_resource_requirements.
+  2. Itera a través de los posibles huecos de tiempo.
+  3. Para cada hueco, comprueba que los recursos necesarios no estén ocupados por otra cita confirmed (verificando appointment_resources) ni bloqueados por un registro en resource_blocks.
+  4. Solo si el hueco de tiempo y todos los recursos necesarios están libres, devuelve el slot como disponible.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Confirma una cita y le asigna los recursos necesarios de forma atómica.
+* Firma de la Función: confirm_appointment_with_resources(p_appointment_id uuid, p_strategy text) returns jsonb
+* Retorno: Un objeto jsonb con el ID de la cita, el nuevo estado y una lista de los recursos asignados.
+* Análisis de la Lógica Interna:
+  1. Bloquea la fila de la cita con FOR UPDATE.
+  2. Verifica que la cita no esté ya confirmada.
+  3. Para cada recurso requerido, comprueba de nuevo su disponibilidad. Si alguno está ocupado, lanza una excepción, revirtiendo la transacción.
+  4. Si todos los recursos están disponibles, los asigna insertando registros en appointment_resources.
+  5. Finalmente, actualiza el estado de la cita a confirmed.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Actualiza los datos de la vista materializada metrics_historical.
+* Firma de la Función: refresh_metrics_historical() returns void
+* Análisis de la Lógica Interna: Ejecuta el comando REFRESH MATERIALIZED VIEW CONCURRENTLY. El uso de CONCURRENTLY permite que la vista sea consultada mientras se está actualizando, evitando bloqueos.
+* Permisos: EXECUTE concedido al rol authenticated.
+
+
+
+* Propósito: Función de utilidad para generar un gran volumen de datos de citas de prueba con fechas pasadas y futuras, y estados distribuidos de forma realista. Nota: Esta es una función para entornos de desarrollo y pruebas, no para uso en producción.
+* Firma de la Función: generate_test_appointments(p_days_back int, p_days_forward int, p_appointments_per_day int) returns void
+* Análisis de la Lógica Interna: Itera sobre un rango de días, seleccionando servicios y clientes aleatorios para crear un número especificado de citas por día. El estado de la cita (confirmed, cancelled, pending) se asigna probabilísticamente en función de si la cita es pasada, presente o futura.
+* Permisos: No especificados; se asume ejecución por un superusuario o rol de desarrollo.
+
+Para facilitar el consumo de datos agregados, el esquema proporciona una capa de abstracción a través de vistas.
+
+6.0 Vistas y Métricas (Data Access Layer)
+
+Las vistas y vistas materializadas desempeñan un papel crucial en el esquema al simplificar el acceso a los datos. Encapsulan consultas complejas, exponen los datos de una manera lógica y centrada en el negocio, y en el caso de las vistas materializadas, mejoran drásticamente el rendimiento de las consultas de reporting y análisis al pre-calcular los resultados.
+
+6.1 Vistas Estándar
+
+Estas vistas calculan sus resultados en tiempo real cada vez que son consultadas.
+
+
+
+* Propósito: Responde a la pregunta: "¿Cuáles son las 10 preguntas más vistas de la base de conocimiento?"
+* Estructura de Salida: Expone las columnas id, category, question, view_count, created_at.
+* Lógica Subyacente: Selecciona de la tabla knowledge_base las entradas con view_count > 0, las ordena de forma descendente por el número de vistas y luego por fecha de creación, y devuelve el top 10.
+
+
+
+* Propósito: Proporciona un resumen diario de métricas clave para un panel de control de administrador.
+* Estructura de Salida: Columnas como day, confirmed_appointments, estimated_revenue, y top_service.
+* Lógica Subyacente: Agrupa las citas por día, calcula el total de citas confirmadas y los ingresos estimados para cada día. También incluye una subconsulta para identificar el servicio más popular del día.
+
+
+
+* Propósito: Ofrece una visión detallada de las métricas de citas por día.
+* Estructura de Salida: day, confirmed_today, pending_today, cancelled_today, revenue_today, top_service_today.
+* Lógica Subyacente: Utiliza CTEs para calcular por separado las estadísticas diarias y el servicio principal de cada día, y luego une los resultados para presentar un informe completo y ordenado por fecha.
+
+
+
+* Propósito: Responde a la pregunta: "¿Cuáles son nuestros servicios más exitosos en términos de volumen e ingresos totales?"
+* Estructura de Salida: service_id, service_name, total_appointments, confirmed_appointments, total_revenue, avg_revenue, first_appointment, last_appointment.
+* Lógica Subyacente: Agrupa todas las citas por servicio y calcula métricas agregadas a lo largo de toda la historia, como el recuento total, los ingresos generados y las fechas de la primera y última cita.
+
+
+
+* Propósito: Identifica rápidamente los productos en el inventario que necesitan ser reabastecidos.
+* Estructura de Salida: id, sku, name, quantity, reorder_threshold, units_needed.
+* Lógica Subyacente: Filtra la tabla inventory para mostrar solo los productos donde la quantity es menor o igual al reorder_threshold. Calcula la columna units_needed para facilitar la gestión de pedidos.
+
+6.2 Vistas Materializadas
+
+A diferencia de las vistas estándar, una vista materializada persiste el conjunto de resultados en disco, actuando como una caché física.
+
+
+
+* Diferencia Estratégica: El análisis de tendencias históricas puede implicar consultas muy pesadas. Al materializar estos datos, las consultas de reporting (e.g., "mostrar ingresos por mes del último año") se vuelven casi instantáneas, ya que leen los datos pre-agregados en lugar de escanear y calcular sobre la tabla appointments cada vez.
+* Propósito: Proporciona datos históricos agregados sobre el rendimiento de las citas, desglosados por día, semana, mes y servicio.
+* Estructura de Salida: period_day, period_week, period_month, service_id, service_name, confirmed_count, cancelled_count, confirmed_revenue, avg_revenue.
+* Mecanismo de Actualización: Los datos de esta vista no se actualizan en tiempo real. Para refrescar su contenido, se debe ejecutar la función public.refresh_metrics_historical().
+
+El acceso a todas estas tablas, vistas y funciones está rigurosamente controlado por un modelo de seguridad a nivel de fila.
+
+7.0 Modelo de Seguridad (Row Level Security)
+
+El sistema implementa un modelo de seguridad robusto y granular utilizando la funcionalidad de Seguridad a Nivel de Fila (Row Level Security - RLS) de PostgreSQL. Esta característica fundamental garantiza que las operaciones de los usuarios sobre los datos se filtren automáticamente a nivel de base de datos. Cada política de seguridad actúa como una cláusula WHERE implícita que se añade a cada consulta, asegurando que los usuarios solo puedan ver y modificar las filas para las que tienen autorización explícita.
+
+Las políticas se basan principalmente en el rol del usuario (owner, lead) y su identidad, que se extraen de un token web JSON (JWT) a través de la función auth.jwt(). Específicamente, se utilizan los claims user_role y phone_number del token para definir las reglas de acceso.
+
+
+
+* ks_insert_authenticated
+  * Comando: INSERT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Cualquier usuario autenticado puede insertar una nueva sugerencia.
+* ks_read_own
+  * Comando: SELECT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Permite la lectura a los usuarios con rol owner O al usuario autenticado que creó la sugerencia, identificado al cruzar el profile_id de la sugerencia con el phone_number del token JWT.
+* ks_owner_manage
+  * Comando: ALL
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Los usuarios con rol owner tienen control total sobre todas las sugerencias.
+
+
+
+* profiles_read
+  * Comando: SELECT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Un owner puede leer todos los perfiles. Un lead solo puede leer su propio perfil, identificado por su phone_number.
+* profiles_owner_insert, profiles_owner_delete
+  * Comando: INSERT, DELETE
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Solo los usuarios con rol owner pueden crear o eliminar perfiles.
+* profiles_owner_update, profiles_lead_update_self
+  * Comando: UPDATE
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Un owner puede actualizar cualquier perfil. Un lead solo puede actualizar su propio perfil.
+
+, , , , , , 
+
+* *_read_all (e.g., services_read_all)
+  * Comando: SELECT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Cualquier usuario autenticado puede leer la información de estas tablas de catálogo y configuración.
+* *_owner_write (e.g., services_owner_write)
+  * Comando: ALL
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Solo los usuarios con rol owner tienen permisos completos de escritura (crear, modificar, eliminar).
+
+, 
+
+* *_owner_all (e.g., appts_owner_all)
+  * Comando: ALL
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Un owner tiene acceso completo a todas las citas y listas de espera.
+* *_lead_read, *_lead_insert, *_lead_update (e.g., appts_lead_read)
+  * Comando: SELECT, INSERT, UPDATE
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Un lead solo puede leer, crear o modificar las entradas asociadas a su propio profile_id.
+
+
+
+* ar_read_owner
+  * Comando: SELECT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Un owner puede leer todas las asignaciones de recursos. Un lead puede ver las asignaciones de recursos para cualquier cita (appointments) que esté vinculada a su propio profile_id.
+* ar_insert_all
+  * Comando: INSERT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: La inserción está permitida a nivel de RLS, ya que la lógica de negocio y la validación de disponibilidad se encapsulan de forma segura en la función confirm_appointment_with_resources.
+
+, 
+
+* *_owner_read (e.g., audit_owner_read)
+  * Comando: SELECT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: Solo los usuarios con rol owner pueden leer los registros de auditoría y la cola de notificaciones.
+* *_insert_all (e.g., audit_insert_all)
+  * Comando: INSERT
+  * Rol(es) Afectado(s): authenticated
+  * Análisis de la Regla: La inserción está permitida para que los usuarios puedan registrar sus propias acciones o para que los triggers del sistema funcionen correctamente.
+
+
+
+* Análisis de Seguridad: La seguridad a nivel de fila (RLS) está intencionadamente deshabilitada en esta tabla. La justificación es que solo un actor del sistema (el bot o backend) escribe en esta tabla en nombre de los usuarios, utilizando un hash anonimizado. Deshabilitar RLS simplifica y optimiza el rendimiento para este caso de uso específico y controlado.
+
+Finalmente, para mantener el rendimiento del sistema, se deben tener en cuenta ciertas consideraciones operativas.
+
+8.0 Consideraciones Operativas
+
+Para asegurar el rendimiento óptimo y sostenido de la base de datos, especialmente en las funcionalidades de búsqueda avanzada, es crucial realizar un mantenimiento regular. Las estadísticas internas que utiliza el planificador de consultas de PostgreSQL para decidir la forma más eficiente de ejecutar una consulta deben mantenerse actualizadas.
+
+Optimización del Planificador de Consultas
+
+Las funciones de búsqueda en la knowledge_base, que dependen en gran medida de los índices de trigramas, son particularmente sensibles a la calidad de las estadísticas de la base de datos. Sin estadísticas precisas, el planificador podría optar por un plan de ejecución subóptimo (como un escaneo secuencial completo en lugar de usar el índice), lo que resultaría en un rendimiento de búsqueda muy deficiente.
+
+Por lo tanto, se recomienda encarecidamente ejecutar los siguientes comandos después de realizar cargas masivas de datos o modificaciones significativas en las tablas knowledge_base y kb_views_footprint:
+
+ANALYZE public.knowledge_base;
+ANALYZE public.kb_views_footprint;
+
+
+* Análisis Funcional: El comando ANALYZE recopila estadísticas sobre la distribución de los datos dentro de las tablas. Para knowledge_base, esto informa al planificador sobre la distribución de trigramas en las columnas de texto, lo cual es vital para estimar correctamente el costo de usar los índices GIN/TRGM. Para kb_views_footprint, mantiene actualizadas las estadísticas sobre las claves primarias compuestas. Ejecutar este paso de forma proactiva asegura que el motor de PostgreSQL siga generando planes de ejecución inteligentes y eficientes al ejecutar las consultas complejas definidas en el esquema.
